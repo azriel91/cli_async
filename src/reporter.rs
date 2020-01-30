@@ -1,37 +1,29 @@
 use std::{fmt, fmt::Write as _, io, io::Write as _};
 
-use crossbeam::{channel, channel::Receiver};
 use indicatif::{ProgressBar, ProgressStyle};
+use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
 use crate::{Colours, PropertyInfoResult, Report};
-
-#[derive(Clone, Copy, Debug)]
-enum ProgressOrInterrupt {
-    Progress(PropertyInfoResult),
-    Interrupt,
-}
 
 #[derive(Debug)]
 pub struct Reporter {
     /// `ProgressBar` for the overall progress.
     progress_overall: ProgressBar,
     /// Receiver to receive updates when a record is processed.
-    progress_receiver: Option<Receiver<PropertyInfoResult>>,
+    progress_receiver: UnboundedReceiver<PropertyInfoResult>,
     /// Process report of records.
     report: Report,
     /// Interrupt handler.
     interrupt_rx: Option<Receiver<()>>,
     /// Whether this reporter has been interrupted.
     interrupted: bool,
-    /// Interrupt handler.
-    progress_or_interrupt_rx: Option<Receiver<ProgressOrInterrupt>>,
 }
 
 impl Reporter {
     pub fn new(
         record_count: u64,
         record_count_processed: u64,
-        progress_receiver: Receiver<PropertyInfoResult>,
+        progress_receiver: UnboundedReceiver<PropertyInfoResult>,
         show_progress: bool,
         interrupt_rx: Option<Receiver<()>>,
     ) -> Self {
@@ -56,20 +48,13 @@ impl Reporter {
             ..Default::default()
         };
 
-        let progress_receiver = Some(progress_receiver);
-
         Self {
             progress_overall,
             progress_receiver,
             report,
             interrupt_rx,
             interrupted: false,
-            progress_or_interrupt_rx: None,
         }
-    }
-
-    pub fn is_interrupted(&self) -> bool {
-        self.interrupted
     }
 
     /// Writes the logo to stderr.
@@ -113,89 +98,40 @@ impl Reporter {
         Ok(())
     }
 
+    pub fn progress_bar_startup(&mut self) {}
+
     /// Synchronizes the progress bar with the state of processing.
-    pub fn progress_bar_startup(&mut self) {
-        if let Some(interrupt_rx) = self.interrupt_rx.take() {
-            // futures::select! {
-            //     () = self.progress_bar_sync_internal().fuse() => {
-            //         self.progress_overall.finish();
-            //     },
-            //     _ = interrupt_rx.recv().fuse() => {},
-            // }
-
-            // We need to listen on both the interrupt channel and the progress channel at the same
-            // time, and consolidate that to a single channel.
-            let (tx, rx) = channel::unbounded::<ProgressOrInterrupt>();
-
-            let progress_tx_interrupt = tx.clone();
-            std::thread::Builder::new()
-                .name(String::from("interrupt_rx_thread"))
-                .spawn(move || {
-                    let _ = interrupt_rx.recv(); // blocks until interrupted.
-                    let _result = progress_tx_interrupt.send(ProgressOrInterrupt::Interrupt);
-                })
-                .expect("Failed to spawn `interrupt_rx thread`.");
-
-            if let Some(progress_receiver) = self.progress_receiver.take() {
-                let progress_tx_interrupt = tx;
-                std::thread::Builder::new()
-                    .name(String::from("progress_rx_thread"))
-                    .spawn(move || {
-                        while let Ok(property_info_result) = progress_receiver.recv() {
-                            progress_tx_interrupt
-                                .send(ProgressOrInterrupt::Progress(property_info_result))
-                                .expect("Failed to pass through property info result");
-                        }
-                    })
-                    .expect("Failed to spawn `progress_rx_thread`.");
+    pub async fn progress_bar_sync(&mut self) {
+        if let Some(mut interrupt_rx) = self.interrupt_rx.take() {
+            tokio::select! {
+                () = self.progress_bar_sync_internal() => {
+                    self.progress_overall.finish();
+                },
+                _ = interrupt_rx.recv() => {},
             }
 
-            self.progress_or_interrupt_rx = Some(rx);
-        } else if let Some(progress_receiver) = self.progress_receiver.take() {
-            let (tx, rx) = channel::unbounded::<ProgressOrInterrupt>();
-
-            let progress_tx_interrupt = tx;
-            std::thread::Builder::new()
-                .name(String::from("progress_rx_thread"))
-                .spawn(move || {
-                    while let Ok(property_info_result) = progress_receiver.recv() {
-                        progress_tx_interrupt
-                            .send(ProgressOrInterrupt::Progress(property_info_result))
-                            .expect("Failed to pass through property info result");
-                    }
-                })
-                .expect("Failed to spawn `progress_rx_thread`.");
-
-            self.progress_or_interrupt_rx = Some(rx);
+        // Empty remaining queue.
+        // self.progress_bar_sync_internal().await;
+        } else {
+            self.progress_bar_sync_internal().await;
+            self.progress_overall.finish();
         }
     }
 
-    pub fn progress_bar_sync(&mut self) {
-        if let Some(pg_or_int_rx) = self.progress_or_interrupt_rx.as_mut() {
-            if let Ok(progres_or_interrupt) = pg_or_int_rx.recv() {
-                match progres_or_interrupt {
-                    ProgressOrInterrupt::Progress(process_result) => {
-                        match process_result {
-                            PropertyInfoResult::Success => {
-                                self.report.record_processed_successful_count += 1;
-                            }
-                            PropertyInfoResult::SuccessPartial => {
-                                self.report.record_processed_info_missing_count += 1;
-                            }
-                            PropertyInfoResult::Error(record, error) => {
-                                self.report.records_processed_failed.push((record, error));
-                            }
-                        }
-                        self.progress_overall.inc(1);
-                    }
-                    ProgressOrInterrupt::Interrupt => {
-                        self.interrupted = true;
-                        self.progress_overall.finish();
-                        // Empty remaining queue.
-                        self.progress_bar_sync();
-                    }
+    async fn progress_bar_sync_internal(&mut self) {
+        while let Some(process_result) = self.progress_receiver.recv().await {
+            match process_result {
+                PropertyInfoResult::Success => {
+                    self.report.record_processed_successful_count += 1;
+                }
+                PropertyInfoResult::SuccessPartial => {
+                    self.report.record_processed_info_missing_count += 1;
+                }
+                PropertyInfoResult::Error(record, error) => {
+                    self.report.records_processed_failed.push((record, error));
                 }
             }
+            self.progress_overall.inc(1);
         }
     }
 

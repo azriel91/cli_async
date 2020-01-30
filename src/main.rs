@@ -1,5 +1,6 @@
-use crossbeam::channel;
+use futures::stream::{StreamExt, TryStreamExt};
 use structopt::{clap::AppSettings, StructOpt};
+use tokio::sync::mpsc;
 
 mod colours;
 mod report;
@@ -29,17 +30,22 @@ mod types {
 /// Startup tasks
 #[rustfmt::skip]
 mod startup {
-    use crossbeam::channel::{self, Receiver};
+    use std::future::Future;
+    use async_ctrlc::CtrlC;
+    use tokio::sync::mpsc::{self, Receiver};
     use crate::{Credentials, PropertyRecord, Reporter};
 
-    pub fn t00_setup_interrupt_handler() -> Receiver<()> {
-        let (tx, rx) = channel::bounded::<()>(2);
+    pub fn t00_setup_interrupt_handler() -> (impl Future<Output = ()>, Receiver<()>) {
+        let (mut tx, rx) = mpsc::channel::<()>(2);
 
-        ctrlc::set_handler(move || {
-            tx.send(()).expect("Failed to send interrupt message.");
-        }).expect("Error setting Ctrl-C handler");
+        let ctrl_c = CtrlC::new().expect("Error setting Ctrl-C handler");
 
-        rx
+        let ctrl_c_future = async move {
+            ctrl_c.await;
+            tx.send(()).await.expect("Failed to send interrupt message.");
+        };
+
+        (ctrl_c_future, rx)
     }
     pub fn t01_read_credentials() -> Credentials { Credentials }
     pub fn t02_stream_property_title_records(n: usize) -> Vec<PropertyRecord> { (0..n).map(PropertyRecord).collect() }
@@ -50,20 +56,23 @@ mod startup {
 /// Looped tasks
 #[rustfmt::skip]
 mod looped {
-    use std::{thread, time::Duration};
+    use std::{time::Duration};
+    use tokio::time::delay_for;
     use crate::{Credentials, PropertyRecord, PropertyInfoResult, PropertyRecordPopulated, Reporter};
 
-    pub fn t05_rate_limit_requests(delay: u64) { thread::sleep(Duration::from_millis(delay)) }
-    pub fn t06_authenticate_with_server(first_time: bool, _: Credentials, delay: u64) { if first_time { thread::sleep(Duration::from_millis(delay)) } }
-    pub fn t07_retrieve_information(n: usize, property_record: PropertyRecord, delay: u64) -> PropertyInfoResult {
-        thread::sleep(Duration::from_millis(delay));
-        if n % 11 == 0 && n % 3 == 0 { PropertyInfoResult::Error(property_record, "Could not find record information online.") }
-        else if n % 3 == 0 { PropertyInfoResult::SuccessPartial }
-        else { PropertyInfoResult::Success }
+    pub async fn t05_rate_limit_requests(delay: u64) { delay_for(Duration::from_millis(delay)).await }
+    pub async fn t06_authenticate_with_server(first_time: bool, _: Credentials, delay: u64) { if first_time { delay_for(Duration::from_millis(delay)).await } }
+    pub async fn t07_retrieve_information(n: usize, property_record: PropertyRecord, delay: u64) -> PropertyInfoResult {
+        async {
+            delay_for(Duration::from_millis(delay)).await;
+            if n % 11 == 0 && n % 3 == 0 { PropertyInfoResult::Error(property_record, "Could not find record information online.") }
+            else if n % 3 == 0 { PropertyInfoResult::SuccessPartial }
+            else { PropertyInfoResult::Success }
+        }.await
     }
     pub fn t08_augment_record(record: PropertyRecord, info: PropertyInfoResult) -> PropertyRecordPopulated { PropertyRecordPopulated { record, info } }
-    pub fn t09_output_record_to_file(_: PropertyRecordPopulated) { thread::sleep(Duration::from_millis(10)) }
-    pub fn t10_update_progress_bar(reporter: &mut Reporter) { reporter.progress_bar_sync(); }
+    pub async fn t09_output_record_to_file(_: PropertyRecordPopulated) { delay_for(Duration::from_millis(10)).await }
+    pub async fn t10_update_progress_bar(reporter: &mut Reporter) { reporter.progress_bar_sync().await }
 }
 
 // Final task
@@ -104,7 +113,8 @@ struct Opt {
     delay_retrieve: u64,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() -> Result<(), ()> {
     let Opt {
         count: record_count,
         skip,
@@ -113,10 +123,10 @@ fn main() {
         delay_retrieve,
     } = Opt::from_args();
 
-    let (progress_tx, progress_rx) = channel::unbounded::<PropertyInfoResult>();
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel::<PropertyInfoResult>();
     Reporter::print_logo().expect("Failed to print logo.");
 
-    let interrupt_rx = t00_setup_interrupt_handler();
+    let (ctrl_c_future, interrupt_rx) = t00_setup_interrupt_handler();
     let credentials = t01_read_credentials();
     let records = t02_stream_property_title_records(record_count);
     let records_precompleted = t03_read_output_file(skip);
@@ -129,29 +139,46 @@ fn main() {
     );
     t04_start_progress_bar(&mut reporter);
 
-    let _result = records
-        .into_iter()
-        .enumerate()
-        .skip(records_precompleted)
-        .map(|(n, record)| {
-            t05_rate_limit_requests(delay_rate_limit);
-            t06_authenticate_with_server(n == 0, credentials, delay_auth);
-            let info = t07_retrieve_information(n, record, delay_retrieve);
-            progress_tx
-                .send(info)
-                .expect("Failed to send progress update.");
-            t08_augment_record(record, info)
-        })
-        .try_for_each(|property_record_populated| {
-            t09_output_record_to_file(property_record_populated);
-            t10_update_progress_bar(&mut reporter);
+    let reporter_future = async move {
+        t10_update_progress_bar(&mut reporter).await;
+        t11_output_execution_report(&reporter);
+    };
 
-            if reporter.is_interrupted() {
-                Err(()) // Quick exit
-            } else {
+    let processing_future = async move {
+        // Hacks for futures:
+        let progress_tx = &progress_tx;
+
+        tokio::stream::iter(records.into_iter().enumerate().skip(records_precompleted))
+            .then(move |(n, record)| async move {
+                t05_rate_limit_requests(delay_rate_limit).await;
+                t06_authenticate_with_server(n == 0, credentials, delay_auth).await;
+                let info = t07_retrieve_information(n, record, delay_retrieve).await;
+                progress_tx
+                    .send(info)
+                    .expect("Failed to send progress update.");
+                Result::<_, ()>::Ok(t08_augment_record(record, info))
+            })
+            .try_for_each_concurrent(10, move |property_record_populated| async move {
+                t09_output_record_to_file(property_record_populated).await;
+
                 Ok(())
-            }
-        });
+            })
+            .await
+    };
 
-    t11_output_execution_report(&reporter);
+    let reporter_handle = tokio::spawn(reporter_future);
+
+    let ctrl_c_handle = tokio::spawn(ctrl_c_future);
+    let processing_handle = tokio::spawn(processing_future);
+
+    let processed_or_interrupted = async {
+        tokio::select! {
+            _ = ctrl_c_handle => {}
+            _ = processing_handle => {}
+        }
+    };
+
+    let (_, _) = tokio::join!(reporter_handle, processed_or_interrupted);
+
+    Ok(())
 }
