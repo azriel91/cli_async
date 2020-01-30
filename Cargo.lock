@@ -419,6 +419,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_cpus"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46203554f085ff89c235cd12f7075f3233af9b11ed7c9e16dfe2560d03313ce6"
+dependencies = [
+ "hermit-abi",
+ "libc",
+]
+
+[[package]]
 name = "number_prefix"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -677,6 +687,7 @@ dependencies = [
  "bytes",
  "fnv",
  "futures-core",
+ "num_cpus",
  "pin-project-lite",
  "slab",
  "tokio-macros",

@@ -11,4 +11,4 @@ futures = "0.3.1"
 indicatif = "0.13.0"
 once_cell = "1.2.0"
 structopt = { version = "0.3.8", features = ["color", "suggestions"] }
-tokio = { version = "0.2.11", features = ["rt-core", "macros", "stream", "sync", "time"] }
+tokio = { version = "0.2.11", features = ["rt-core", "rt-threaded", "macros", "stream", "sync", "time"] }
