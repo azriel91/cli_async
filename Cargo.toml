@@ -1,0 +1,13 @@
+[package]
+name = "cli_async"
+version = "0.1.0"
+authors = ["Azriel Hoh <azriel91@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+crossbeam = "0.7.3"
+crossterm = "0.14.2"
+ctrlc = "3.1.3"
+indicatif = "0.13.0"
+once_cell = "1.2.0"
+structopt = { version = "0.3.8", features = ["color", "suggestions"] }
