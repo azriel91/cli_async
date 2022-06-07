@@ -15,8 +15,6 @@ pub struct Reporter {
     report: Report,
     /// Interrupt handler.
     interrupt_rx: Option<Receiver<()>>,
-    /// Whether this reporter has been interrupted.
-    interrupted: bool,
 }
 
 impl Reporter {
@@ -53,7 +51,6 @@ impl Reporter {
             progress_receiver,
             report,
             interrupt_rx,
-            interrupted: false,
         }
     }
 
@@ -136,7 +133,7 @@ impl Reporter {
     }
 
     /// Writes the report to stderr.
-    pub fn print_report(&self) -> crossterm::Result<()> {
+    pub fn print_report(&self) -> fmt::Result {
         let self_report = &self.report;
         let failed_count = self_report.records_processed_failed.len();
 
@@ -264,8 +261,10 @@ impl Reporter {
         )?;
 
         let mut stderr = io::stderr();
-        stderr.write_all(report.as_bytes())?;
-        stderr.flush()?;
+        stderr
+            .write_all(report.as_bytes())
+            .expect("Failed to write to stdout.");
+        stderr.flush().expect("Failed to flush stdout.");
 
         Ok(())
     }

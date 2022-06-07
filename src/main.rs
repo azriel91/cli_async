@@ -1,4 +1,4 @@
-use futures::stream::{StreamExt, TryStreamExt};
+use futures::{stream, StreamExt, TryStreamExt};
 use structopt::{clap::AppSettings, StructOpt};
 use tokio::sync::mpsc;
 
@@ -36,7 +36,7 @@ mod startup {
     use crate::{Credentials, PropertyRecord, Reporter};
 
     pub fn t00_setup_interrupt_handler() -> (impl Future<Output = ()>, Receiver<()>) {
-        let (mut tx, rx) = mpsc::channel::<()>(2);
+        let (tx, rx) = mpsc::channel::<()>(2);
 
         let ctrl_c = CtrlC::new().expect("Error setting Ctrl-C handler");
 
@@ -57,21 +57,21 @@ mod startup {
 #[rustfmt::skip]
 mod looped {
     use std::{time::Duration};
-    use tokio::time::delay_for;
+    use tokio::time::sleep;
     use crate::{Credentials, PropertyRecord, PropertyInfoResult, PropertyRecordPopulated, Reporter};
 
-    pub async fn t05_rate_limit_requests(delay: u64) { delay_for(Duration::from_millis(delay)).await }
-    pub async fn t06_authenticate_with_server(first_time: bool, _: Credentials, delay: u64) { if first_time { delay_for(Duration::from_millis(delay)).await } }
+    pub async fn t05_rate_limit_requests(delay: u64) { sleep(Duration::from_millis(delay)).await }
+    pub async fn t06_authenticate_with_server(first_time: bool, _: Credentials, delay: u64) { if first_time { sleep(Duration::from_millis(delay)).await } }
     pub async fn t07_retrieve_information(n: usize, property_record: PropertyRecord, delay: u64) -> PropertyInfoResult {
         async {
-            delay_for(Duration::from_millis(delay)).await;
+            sleep(Duration::from_millis(delay)).await;
             if n % 11 == 0 && n % 3 == 0 { PropertyInfoResult::Error(property_record, "Could not find record information online.") }
             else if n % 3 == 0 { PropertyInfoResult::SuccessPartial }
             else { PropertyInfoResult::Success }
         }.await
     }
     pub fn t08_augment_record(record: PropertyRecord, info: PropertyInfoResult) -> PropertyRecordPopulated { PropertyRecordPopulated { record, info } }
-    pub async fn t09_output_record_to_file(_: PropertyRecordPopulated) { delay_for(Duration::from_millis(10)).await }
+    pub async fn t09_output_record_to_file(_: PropertyRecordPopulated) { sleep(Duration::from_millis(10)).await }
     pub async fn t10_update_progress_bar(reporter: &mut Reporter) { reporter.progress_bar_sync().await }
 }
 
@@ -148,7 +148,7 @@ async fn main() -> Result<(), ()> {
         // Hacks for futures:
         let progress_tx = &progress_tx;
 
-        tokio::stream::iter(records.into_iter().enumerate().skip(records_precompleted))
+        stream::iter(records.into_iter().enumerate().skip(records_precompleted))
             .then(move |(n, record)| async move {
                 t05_rate_limit_requests(delay_rate_limit).await;
                 t06_authenticate_with_server(n == 0, credentials, delay_auth).await;
